@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="theme-color" content="#1d5d4f">
+<title>锦鲤池</title>
+<meta name="description" content="一池青绿色的水，六条锦鲤游来游去。轻触水面撒食，它们朝你游来。">
+<meta property="og:title" content="锦鲤池">
+<meta property="og:description" content="轻触水面撒下鱼食，六条锦鲤朝你游来抢食。">
+<meta property="og:type" content="website">
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#0e463d;overscroll-behavior:none}
+  canvas{display:block;width:100vw;height:100vh;touch-action:none}
+  #hint{position:fixed;left:0;right:0;bottom:26px;text-align:center;pointer-events:none;
+    color:rgba(235,255,248,.55);font:13px/1.6 system-ui,-apple-system,"PingFang SC",sans-serif;
+    letter-spacing:.25em;transition:opacity 1.4s ease}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<p id="hint">轻触水面 · 锦鲤会游过来</p>
+<script>
+(() => {
+'use strict';
+const cv = document.getElementById('c'), ctx = cv.getContext('2d'), hint = document.getElementById('hint');
+const TAU = Math.PI*2;
+const rand = (a,b) => a + Math.random()*(b-a);
+const lerp = (a,b,k) => a + (b-a)*k;
+const angDiff = (a,b) => { let d = (b-a) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; };
+let W = 0, H = 0, bg = null, vig = null, last = 0;
+let specks = [], pads = [], fish = [], foos = [], rings = [], shim = [];
+const P = { x: 0, y: 0, t: -1e9 };
+const lastR = { x: 1e9, y: 1e9, t: 0 };
+window.addEventListener('error', e => { window.__err = String(e.message); });
+
+const PALS = [
+  { base:'#f7f2e6', ps:[['#ff7031',3]] },
+  { base:'#f7f2e6', ps:[['#ff4b22',2],['#23262c',2]] },
+  { base:'#ffb340', ps:[['#fff4da',2]] },
+  { base:'#2b2e34', ps:[['#ff8a3d',3]] },
+  { base:'#ffe9c9', ps:[['#ff5e2b',2]] },
+  { base:'#f7f2e6', ps:[['#ffa63d',3]] },
+];
+
+function prof(u){ return Math.pow(Math.sin(Math.PI*(0.12+0.78*u)), 1.1); }
+
+function makeFish(i){
+  const pal = PALS[i % PALS.length];
+  const L = rand(78,118), N = 13;
+  const f = { L, W: L*0.27, N, heading: rand(0,TAU), spd: 0.45, base: pal.base,
+    wf: rand(0.9,1.3), wanderF: rand(0.3,0.6), wanderP: rand(0,TAU), patches: [], pts: [] };
+  for (const [c,n] of pal.ps){
+    for (let k=0;k<n;k++) f.patches.push({ c, t: rand(0.12,0.72), s: rand(-0.62,0.62), r: rand(0.45,1.05) });
+  }
+  const x = rand(W*0.2,W*0.8), y = rand(H*0.2,H*0.8), seg = L/(N-1);
+  for (let k=0;k<N;k++) f.pts.push({ x: x-Math.cos(f.heading)*k*seg, y: y-Math.sin(f.heading)*k*seg });
+  return f;
+}
+
+function resize(){
+  const dpr = Math.min(devicePixelRatio||1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = W*dpr|0; cv.height = H*dpr|0;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  bg = ctx.createLinearGradient(0,0,W*0.4,H);
+  bg.addColorStop(0,'#8ed3bd'); bg.addColorStop(0.5,'#3f9179'); bg.addColorStop(1,'#0e463d');
+  vig = ctx.createRadialGradient(W/2,H/2,Math.min(W,H)*0.2, W/2,H/2, Math.max(W,H)*0.78);
+  vig.addColorStop(0,'rgba(5,38,32,0)'); vig.addColorStop(1,'rgba(3,28,24,0.40)');
+  specks = Array.from({length:26}, () => ({ x: Math.random()*W, y: Math.random()*H, r: rand(0.8,2.2), p: rand(0,TAU), s: rand(0.15,0.5), a: rand(0.05,0.16) }));
+  shim = Array.from({length:4}, () => ({ x: rand(0,W), y: rand(0,H), r: rand(120,220), p: rand(0,TAU) }));
+  const padDefs = [[0.16,0.13,52],[0.87,0.24,60],[0.82,0.80,50],[0.18,0.84,56],[0.64,0.52,40]];
+  pads = padDefs.map((d,i) => ({ x: d[0]*W, y: d[1]*H, r: d[2], rot: rand(0,TAU), ph: rand(0,TAU), flower: i===1||i===3 }));
+  const n = Math.max(4, Math.min(7, Math.round(W*H/65000)));
+  while (fish.length < n) fish.push(makeFish(fish.length));
+  fish.length = n;
+}
+
+function smoothClosed(path, pts){
+  const n = pts.length;
+  path.moveTo((pts[n-1].x+pts[0].x)/2, (pts[n-1].y+pts[0].y)/2);
+  for (let i=0;i<n;i++){
+    const p = pts[i], q = pts[(i+1)%n];
+    path.quadraticCurveTo(p.x, p.y, (p.x+q.x)/2, (p.y+q.y)/2);
+  }
+  path.closePath();
+}
+
+function fishFrame(f, now){
+  const t = now/1000, N = f.N, pts = [], nrm = [], wid = [];
+  for (let i=0;i<N;i++){
+    const p = f.pts[i];
+    const a = f.pts[Math.max(0,i-1)], b = f.pts[Math.min(N-1,i+1)];
+    let tx = b.x-a.x, ty = b.y-a.y, d = Math.hypot(tx,ty)||1;
+    tx/=d; ty/=d;
+    const off = Math.sin(t*TAU*f.wf - i*0.85) * f.L*0.04 * (i/(N-1));
+    pts.push({ x: p.x - ty*off, y: p.y + tx*off });
+    nrm.push({ x: -ty, y: tx, ang: Math.atan2(ty,tx) });
+    wid.push(f.W * prof(i/(N-1)));
+  }
+  return { pts, nrm, wid };
+}
+
+function drawFish(f, now){
+  const t = now/1000, N = f.N, F = fishFrame(f, now), sc = f.L/110;
+  const Lp = [], Rp = [];
+  for (let i=0;i<N;i++){
+    Lp.push({ x: F.pts[i].x + F.nrm[i].x*F.wid[i], y: F.pts[i].y + F.nrm[i].y*F.wid[i] });
+    Rp.push({ x: F.pts[i].x - F.nrm[i].x*F.wid[i], y: F.pts[i].y - F.nrm[i].y*F.wid[i] });
+  }
+  const body = new Path2D();
+  smoothClosed(body, Lp.concat(Rp.slice().reverse()));
+
+  const iT = N-1, sway = Math.sin(t*TAU*f.wf - N*0.85)*0.45;
+  ctx.save();
+  ctx.translate(F.pts[iT].x, F.pts[iT].y);
+  ctx.rotate(F.nrm[iT].ang + sway*0.35);
+  ctx.scale(sc, sc);
+  ctx.globalAlpha = 0.85; ctx.fillStyle = f.base;
+  ctx.beginPath();
+  ctx.moveTo(-2,-3);
+  ctx.quadraticCurveTo(10,-17, 21,-7);
+  ctx.quadraticCurveTo(15,-1, 21,5);
+  ctx.quadraticCurveTo(10,16, -2,3);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+
+  ctx.save(); ctx.translate(5,9); ctx.fillStyle = 'rgba(3,30,25,0.20)'; ctx.fill(body); ctx.restore();
+  ctx.fillStyle = f.base; ctx.fill(body);
+
+  if (f.patches.length){
+    ctx.save(); ctx.clip(body);
+    for (const b of f.patches){
+      const fi = b.t*(N-1), i0 = Math.floor(fi), fr = fi-i0, i1 = Math.min(N-1, i0+1);
+      const px = lerp(F.pts[i0].x, F.pts[i1].x, fr) + F.nrm[i0].x*b.s*F.wid[i0];
+      const py = lerp(F.pts[i0].y, F.pts[i1].y, fr) + F.nrm[i0].y*b.s*F.wid[i0];
+      const rr = b.r*f.W*1.35;
+      ctx.fillStyle = b.c;
+      ctx.beginPath(); ctx.ellipse(px, py, rr*1.4, rr*0.95, F.nrm[i0].ang, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  ctx.strokeStyle = 'rgba(8,42,36,0.28)'; ctx.lineWidth = 1.1; ctx.stroke(body);
+
+  ctx.beginPath();
+  for (let i=0;i<N;i++){
+    const px = F.pts[i].x + F.nrm[i].x*F.wid[i]*0.38;
+    const py = F.pts[i].y + F.nrm[i].y*F.wid[i]*0.38;
+    if (i) ctx.lineTo(px,py); else ctx.moveTo(px,py);
+  }
+  ctx.strokeStyle = 'rgba(255,255,255,0.16)'; ctx.lineWidth = 2*sc; ctx.lineJoin = 'round'; ctx.stroke();
+
+  const iF = 3;
+  for (const s of [1,-1]){
+    const px = F.pts[iF].x + F.nrm[iF].x*s*F.wid[iF]*0.92;
+    const py = F.pts[iF].y + F.nrm[iF].y*s*F.wid[iF]*0.92;
+    const flap = Math.sin(t*TAU*f.wf*1.6 + (s>0?0:2.1))*0.35;
+    ctx.save();
+    ctx.translate(px,py);
+    ctx.rotate(F.nrm[iF].ang + Math.PI/2 + flap*(s>0?1:-1));
+    ctx.globalAlpha = 0.8; ctx.fillStyle = f.base;
+    ctx.beginPath(); ctx.ellipse(0, 0, 6.5*sc, 2.6*sc, 0, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+
+  for (const s of [1,-1]){
+    const iE = 1;
+    const ex = F.pts[iE].x + F.nrm[iE].x*s*F.wid[iE]*0.55;
+    const ey = F.pts[iE].y + F.nrm[iE].y*s*F.wid[iE]*0.55;
+    ctx.fillStyle = '#20242a';
+    ctx.beginPath(); ctx.arc(ex,ey,2.3*sc,0,TAU); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.beginPath(); ctx.arc(ex-0.7*sc, ey-0.7*sc, 0.8*sc, 0, TAU); ctx.fill();
+  }
+}
+
+function drawPad(p, now){
+  const t = now/1000;
+  ctx.save();
+  ctx.translate(p.x, p.y + Math.sin(t*0.5+p.ph)*3);
+  ctx.rotate(p.rot + Math.sin(t*0.12+p.ph)*0.04);
+  ctx.fillStyle = 'rgba(3,30,25,0.16)';
+  ctx.beginPath(); ctx.ellipse(4,7,p.r,p.r*0.94,0,0,TAU); ctx.fill();
+  const g = ctx.createRadialGradient(-p.r*0.2,-p.r*0.25,p.r*0.15, 0,0,p.r);
+  g.addColorStop(0,'#7cc98b'); g.addColorStop(0.7,'#4e9e63'); g.addColorStop(1,'#2f7a4e');
+  ctx.fillStyle = g;
+  const gap = 0.52;
+  ctx.beginPath(); ctx.moveTo(0,0); ctx.arc(0,0,p.r, gap/2, TAU-gap/2); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.13)'; ctx.lineWidth = 1;
+  for (let k=0;k<5;k++){
+    const a = gap/2 + 0.25 + k*(TAU-gap-0.5)/4;
+    ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(Math.cos(a)*p.r*0.92, Math.sin(a)*p.r*0.92); ctx.stroke();
+  }
+  ctx.strokeStyle = 'rgba(20,70,45,0.35)'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.arc(0,0,p.r, gap/2, TAU-gap/2); ctx.stroke();
+  if (p.flower){
+    const s = p.r*0.42;
+    for (let k=0;k<6;k++){
+      ctx.save(); ctx.rotate(k*TAU/6);
+      ctx.fillStyle = k%2 ? '#ffb7d2' : '#ff9ec4';
+      ctx.beginPath(); ctx.ellipse(0, -s*0.55, s*0.32, s*0.55, 0, 0, TAU); ctx.fill();
+      ctx.restore();
+    }
+    ctx.fillStyle = '#ffd93b';
+    ctx.beginPath(); ctx.arc(0,0,s*0.22,0,TAU); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function stepAll(now, dt){
+  const t = now/1000;
+  for (const f of fish){
+    const head = f.pts[0];
+    let sx = null, sy = null, seeking = false;
+    let bd = 1e9, best = null;
+    for (const o of foos){
+      const dx = o.x-head.x, dy = o.y-head.y, d2 = dx*dx+dy*dy;
+      if (d2 < bd && d2 < 330*330){ bd = d2; best = o; }
+    }
+    if (best){ sx = best.x; sy = best.y; seeking = true; }
+    else if (now-P.t < 1600){
+      const dx = P.x-head.x, dy = P.y-head.y;
+      if (dx*dx+dy*dy < 250*250){ sx = P.x; sy = P.y; }
+    }
+    f.heading += Math.sin(t*f.wanderF*TAU + f.wanderP)*0.010*dt;
+    if (sx !== null) f.heading += angDiff(f.heading, Math.atan2(sy-head.y, sx-head.x)) * Math.min(1, 0.06*dt);
+    for (const g of fish){
+      if (g === f) continue;
+      const ox = head.x - g.pts[0].x, oy = head.y - g.pts[0].y, od2 = ox*ox + oy*oy;
+      if (od2 < 3025 && od2 > 1){
+        const od = Math.sqrt(od2);
+        f.heading += angDiff(f.heading, Math.atan2(oy, ox)) * (1 - od/55) * 0.09 * dt;
+      }
+    }
+    const m = 84, dEdge = Math.min(head.x, W-head.x, head.y, H-head.y);
+    if (dEdge < m) f.heading += angDiff(f.heading, Math.atan2(H/2-head.y, W/2-head.x)) * (1-dEdge/m) * 0.10*dt;
+
+    const tSpd = seeking ? 1.5 : (sx !== null ? 0.95 : 0.5);
+    f.spd = lerp(f.spd, tSpd, Math.min(1, 0.05*dt));
+    head.x += Math.cos(f.heading)*f.spd*dt;
+    head.y += Math.sin(f.heading)*f.spd*dt;
+
+    const seg = f.L/(f.N-1);
+    for (let i=1;i<f.N;i++){
+      const a = f.pts[i-1], b = f.pts[i];
+      const dx = b.x-a.x, dy = b.y-a.y, d = Math.hypot(dx,dy)||1;
+      b.x = a.x + dx/d*seg;
+      b.y = a.y + dy/d*seg;
+    }
+
+    for (let k=foos.length-1;k>=0;k--){
+      const o = foos[k];
+      if (Math.hypot(o.x-head.x, o.y-head.y) < 16){
+        foos.splice(k,1);
+        rings.push({ x:o.x, y:o.y, t0:now, s:3, e:18, a:0.5 });
+      }
+    }
+  }
+  for (let a=0;a<fish.length;a++){
+    const ha = fish[a].pts[0];
+    for (let b=a+1;b<fish.length;b++){
+      const hb = fish[b].pts[0];
+      const dx = hb.x-ha.x, dy = hb.y-ha.y, d = Math.hypot(dx,dy)||1;
+      if (d < 58){
+        const push = (58-d)*0.045*dt, ux = dx/d, uy = dy/d;
+        ha.x -= ux*push; ha.y -= uy*push;
+        hb.x += ux*push; hb.y += uy*push;
+      }
+    }
+  }
+  for (let k=foos.length-1;k>=0;k--){
+    const o = foos[k];
+    o.y += 0.06*dt; o.age = (o.age||0) + dt;
+    if (o.age > 1500) foos.splice(k,1);
+  }
+}
+
+function feed(px, py, now){
+  for (let k=0;k<3;k++) foos.push({ x: px+rand(-30,30), y: py+rand(-24,24), age: 0 });
+  while (foos.length > 14) foos.shift();
+  rings.push({ x:px, y:py, t0:now, s:6, e:64, a:0.32 });
+  P.x = px; P.y = py; P.t = now;
+}
+
+function drawAll(now){
+  const t = now/1000;
+  ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+  ctx.fillStyle = bg; ctx.fillRect(0,0,W,H);
+
+  ctx.globalCompositeOperation = 'lighter';
+  for (const s of shim){
+    const x = s.x + Math.sin(t*0.11+s.p)*70, y = s.y + Math.cos(t*0.09+s.p*1.7)*46;
+    const g = ctx.createRadialGradient(x,y,0, x,y,s.r);
+    g.addColorStop(0,'rgba(255,255,240,0.045)'); g.addColorStop(1,'rgba(255,255,240,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x,y,s.r,0,TAU); ctx.fill();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = vig; ctx.fillRect(0,0,W,H);
+
+  for (const s of specks){
+    s.x -= 0.06; s.y -= 0.02;
+    if (s.x < -5) s.x = W+5;
+    if (s.y < -5) s.y = H+5;
+    ctx.globalAlpha = s.a*(0.5+0.5*Math.sin(t*s.s*TAU+s.p));
+    ctx.fillStyle = '#eafff4';
+    ctx.beginPath(); ctx.arc(s.x,s.y,s.r,0,TAU); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  for (const f of fish) drawFish(f, now);
+
+  for (const o of foos){
+    ctx.fillStyle = '#b5762f';
+    ctx.beginPath(); ctx.arc(o.x,o.y,3,0,TAU); ctx.fill();
+    ctx.fillStyle = '#e2a75e';
+    ctx.beginPath(); ctx.arc(o.x-0.8,o.y-0.9,1.3,0,TAU); ctx.fill();
+  }
+
+  for (let i=rings.length-1;i>=0;i--){
+    const r = rings[i], k = (now-r.t0)/850;
+    if (k >= 1){ rings.splice(i,1); continue; }
+    const rr = Math.max(0.5, r.s + (r.e-r.s)*Math.max(0,k));
+    ctx.globalAlpha = Math.max(0, (1-k))*r.a;
+    ctx.strokeStyle = 'rgba(228,255,247,1)'; ctx.lineWidth = 1.1;
+    ctx.beginPath(); ctx.arc(r.x, r.y, rr, 0, TAU); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  for (const p of pads) drawPad(p, now);
+}
+
+function frame(now){
+  const dt = Math.min(Math.max((now-last)/16.667, 0), 2.5); last = now;
+  stepAll(now, dt);
+  drawAll(now);
+  requestAnimationFrame(frame);
+}
+
+cv.addEventListener('pointerdown', e => {
+  const now = performance.now();
+  feed(e.clientX, e.clientY, now);
+  hint.style.opacity = 0;
+});
+cv.addEventListener('pointermove', e => {
+  const now = performance.now();
+  P.x = e.clientX; P.y = e.clientY; P.t = now;
+  if (now-lastR.t > 280 && Math.hypot(e.clientX-lastR.x, e.clientY-lastR.y) > 46){
+    rings.push({ x:e.clientX, y:e.clientY, t0:now, s:4, e:30, a:0.16 });
+    lastR.x = e.clientX; lastR.y = e.clientY; lastR.t = now;
+  }
+});
+addEventListener('resize', resize);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) last = performance.now(); });
+
+resize();
+last = performance.now();
+window.__fish = fish; window.__foos = foos; window.__P = P; window.__feed = feed;
+window.__stepAll = stepAll; window.__drawAll = drawAll;
+window.__render = (t0, n) => { for (let i=0;i<n;i++){ const tt = t0 + i*16.7; stepAll(tt, 1); drawAll(tt); } last = t0 + n*16.7; };
+requestAnimationFrame(frame);
+setTimeout(() => { hint.style.opacity = 0; }, 9000);
+})();
+</script>
+</body>
+</html>
